@@ -5,13 +5,15 @@
  */
 #include "csapp.h"
 
+enum methods{ GET = 0, HEAD = 1, POST = 2 };
+
 void doit(int fd);
 int is_file_valid(char *filename, struct stat *sbuf, int fd);
-void read_requesthdrs(rio_t *rp);
-int parse_uri(char *uri, char *filename, char *cgiargs);
-void serve_static(int fd, char *filename, int filesize, int headOnly);
+void read_requesthdrs(rio_t *rp, int methopType, char *cgiargs);
+int parse_uri(char *uri, char *filename, char *cgiargs, int methodType);
+void serve_static(int fd, char *filename, int filesize, int methodType);
 void get_filetype(char *filename, char *filetype);
-void serve_dynamic(int fd, char *filename, char *cgiargs, int headOnly);
+void serve_dynamic(int fd, char *filename, char *cgiargs);
 void clienterror(int fd,
                  char *cause,
                  char *errnum,
@@ -57,7 +59,7 @@ int main(int argc, char **argv)
 void doit(int fd)
 {
     int is_static;
-    int is_head_method = 0;
+    int methopType = 0;
     struct stat sbuf;
     char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
     char filename[MAXLINE], cgiargs[MAXLINE];
@@ -68,13 +70,22 @@ void doit(int fd)
     if (!Rio_readlineb(&rio, buf, MAXLINE))  // line:netp:doit:readrequest
         return;
     printf("%s", buf);
-    sscanf(buf, "%s %s %s", method, uri, version);     //line:netp:doit:parserequest   
-    if (strcasecmp(method, "HEAD") == 0) // HEAD method do not need response body
-        is_head_method = 1;
+    sscanf(buf, "%s %s %s", method, uri, version);     //line:netp:doit:parserequest  
+    if (strcasecmp(method, "GET") == 0)
+        methopType = GET;       
+    else if (strcasecmp(method, "HEAD") == 0) // HEAD method do not need response body
+        methopType = HEAD;
+    else if (strcasecmp(method, "POST") == 0)
+        methopType = POST;
+    else {
+        clienterror(fd, method, "501", "Not Implemented",
+            "Tiny does not implement this method");
+        return;  
+    }
 
-    read_requesthdrs(&rio);  // line:netp:doit:readrequesthdrs
+    read_requesthdrs(&rio, methopType, cgiargs);  // line:netp:doit:readrequesthdrs
     /* Parse URI from HTTP request */
-    is_static = parse_uri(uri, filename, cgiargs);  // line:netp:doit:staticcheck
+    is_static = parse_uri(uri, filename, cgiargs, methopType);  // line:netp:doit:staticcheck
     if (stat(filename, &sbuf) < 0) {  // line:netp:doit:beginnotfound
         clienterror(fd, filename, "404", "Not found",
                     "Tiny couldn't find this file");
@@ -88,7 +99,7 @@ void doit(int fd)
                         "Tiny couldn't read the file");
             return;
         }
-        serve_static(fd, filename, sbuf.st_size, is_head_method);  // line:netp:doit:servestatic
+        serve_static(fd, filename, sbuf.st_size, methopType);  // line:netp:doit:servestatic
     } else {                                       /* Serve dynamic content */
         if (!(S_ISREG(sbuf.st_mode)) ||
             !(S_IXUSR & sbuf.st_mode)) {  // line:netp:doit:executable
@@ -96,7 +107,7 @@ void doit(int fd)
                         "Tiny couldn't run the CGI program");
             return;
         }
-        serve_dynamic(fd, filename, cgiargs, is_head_method);  // line:netp:doit:servedynamic
+        serve_dynamic(fd, filename, cgiargs);  // line:netp:doit:servedynamic
     }
 }
 /* $end doit */
@@ -106,7 +117,7 @@ void doit(int fd)
  * read_requesthdrs - read HTTP request headers
  */
 /* $begin read_requesthdrs */
-void read_requesthdrs(rio_t *rp)
+void read_requesthdrs(rio_t *rp, int methopType, char *cgiargs)
 {
     char buf[MAXLINE];
 
@@ -117,6 +128,12 @@ void read_requesthdrs(rio_t *rp)
         printf("%s", buf);
     }
     fflush(stdout);
+
+    if ( methopType == POST ) { // updte cgiargs when using POST
+        Rio_readnb(rp, buf, rp->rio_cnt);
+        strcpy(cgiargs, buf);        
+    }
+
     return;
 }
 /* $end read_requesthdrs */
@@ -126,7 +143,7 @@ void read_requesthdrs(rio_t *rp)
  *             return 0 if dynamic content, 1 if static
  */
 /* $begin parse_uri */
-int parse_uri(char *uri, char *filename, char *cgiargs)
+int parse_uri(char *uri, char *filename, char *cgiargs, int methodType)
 {
     char *ptr;
 
@@ -139,12 +156,14 @@ int parse_uri(char *uri, char *filename, char *cgiargs)
             strcat(filename, "home.html");  // line:netp:parseuri:appenddefault
         return 1;
     } else { /* Dynamic content */  // line:netp:parseuri:isdynamic
-        ptr = index(uri, '?');      // line:netp:parseuri:beginextract
-        if (ptr) {
-            strcpy(cgiargs, ptr + 1);
-            *ptr = '\0';
-        } else
-            strcpy(cgiargs, "");  // line:netp:parseuri:endextract
+        if ( methodType == GET ) { // update cgiargs when using GET
+            ptr = index(uri, '?');      // line:netp:parseuri:beginextract
+            if (ptr) {
+                strcpy(cgiargs, ptr + 1);
+                *ptr = '\0';
+            } else
+                strcpy(cgiargs, "");  // line:netp:parseuri:endextract
+        }
         strcpy(filename, ".");    // line:netp:parseuri:beginconvert2
         strcat(filename, uri);    // line:netp:parseuri:endconvert2
         return 0;
@@ -156,7 +175,7 @@ int parse_uri(char *uri, char *filename, char *cgiargs)
  * serve_static - copy a file back to the client
  */
 /* $begin serve_static */
-void serve_static(int fd, char *filename, int filesize, int headOnly)
+void serve_static(int fd, char *filename, int filesize, int methodType)
 {
     int srcfd;
     char filetype[MAXLINE], buf[MAXBUF], *fbuf;
@@ -172,7 +191,7 @@ void serve_static(int fd, char *filename, int filesize, int headOnly)
     printf("Response headers:\n");
     printf("%s", buf);
     
-    if (!headOnly) {
+    if (methodType != HEAD) {
         /* Send response body to client */
         srcfd = Open(filename, O_RDONLY, 0);    //line:netp:servestatic:open
         fbuf = malloc(filesize);
@@ -207,7 +226,7 @@ void get_filetype(char *filename, char *filetype)
  * serve_dynamic - run a CGI program on behalf of the client
  */
 /* $begin serve_dynamic */
-void serve_dynamic(int fd, char *filename, char *cgiargs, int headOnly)
+void serve_dynamic(int fd, char *filename, char *cgiargs)
 {
     if (signal(SIGCHLD,sigchldHandler) == SIG_ERR ) unix_error("signal error");
     char buf[MAXLINE], *emptylist[] = {NULL};
